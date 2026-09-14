@@ -3400,31 +3400,22 @@ function normalizeUdpRelayConfig(value) {
 }
 
 async function openWebSocketRelay(url) {
-    const ws = new WebSocket(url);
+    const relayUrl = new URL(url);
+    relayUrl.protocol = relayUrl.protocol === 'wss:' ? 'https:' : 'http:';
+    const response = await fetch(relayUrl, {
+        headers: {
+            Upgrade: 'websocket',
+        },
+    });
+    const ws = response.webSocket;
+    if (response.status !== 101 || !ws) {
+        throw new Error(`UDP relay WebSocket upgrade failed (HTTP ${response.status})`);
+    }
     try {
         ws.binaryType = 'arraybuffer';
     }
     catch { }
-    await new Promise((resolve, reject) => {
-        let settled = false;
-        const cleanup = () => {
-            ws.removeEventListener('open', onOpen);
-            ws.removeEventListener('error', onError);
-            ws.removeEventListener('close', onClose);
-        };
-        const finish = (fn, value) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            fn(value);
-        };
-        const onOpen = () => finish(resolve);
-        const onError = (event) => finish(reject, new Error(`UDP relay WebSocket connection failed${event?.message ? `: ${event.message}` : ''}`));
-        const onClose = (event) => finish(reject, new Error(`UDP relay WebSocket closed during connect (${event?.code || 1006})`));
-        ws.addEventListener('open', onOpen);
-        ws.addEventListener('error', onError);
-        ws.addEventListener('close', onClose);
-    });
+    ws.accept({ allowHalfOpen: true });
     let ended = false;
     let messageChain = Promise.resolve();
     const readable = new ReadableStream({
