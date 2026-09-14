@@ -1,6 +1,6 @@
 # cfw2ray
 
-Worker Cloudflare buat jalanin VLESS, Trojan, VMess, dan Shadowsocks langsung dari edge Cloudflare. Karena Worker sendiri nggak bisa handle UDP, trafik UDP-nya di-relay ke VPS lewat koneksi TCP.
+Worker Cloudflare buat jalanin VLESS, Trojan, VMess, dan Shadowsocks langsung dari edge Cloudflare. Karena Worker sendiri nggak bisa handle UDP, trafik UDP-nya di-relay ke VPS lewat koneksi TCP atau WebSocket.
 
 ## Cara kerjanya
 
@@ -8,7 +8,7 @@ Worker Cloudflare buat jalanin VLESS, Trojan, VMess, dan Shadowsocks langsung da
 flowchart LR
     C[Client] -->|WSS / HTTPS| W[Cloudflare Worker / worker.js]
     W -->|TCP langsung| T[TCP target]
-    W -->|Koneksi TCP| R[VPS UDP relay / udprelay.js]
+    W -->|TCP atau WebSocket/WSS| R[VPS UDP relay]
     R -->|UDP| U[UDP target]
     W -->|DNS UDP/53| D[DNS-over-HTTPS]
 ```
@@ -23,8 +23,17 @@ Buka `worker.js`, terus edit bagian `CONFIG` di paling atas:
 const CONFIG = Object.freeze({
     UUID: 'UUID-ANDA',
     SS_METHOD: 'aes-128-gcm',
-    UDP_RELAY_HOST: 'IP-VPS-ANDA',
-    UDP_RELAY_PORT: 8443,
+
+    // Pilih salah satu:
+    // TCP relay. Jika host dan port valid, opsi websocket diabaikan.
+    // UDP_RELAY: { host: 'IP-VPS-ANDA', port: 8443 },
+
+    // WebSocket relay:
+    UDP_RELAY: {
+        websocket: 'wss://relay.example.com/',
+        // websocket: 'ws://IP-VPS-ANDA:8080/',
+    },
+
     MAX_PROTOCOL_HEADER: 4096,
     MAX_TCP_PROXY_REPLAY: 4 * 1024 * 1024,
     REJECT_UDP_443: true,
@@ -39,9 +48,51 @@ const CONFIG = Object.freeze({
 Beberapa hal yang perlu diperhatikan:
 
 - **`UUID`** — dipakai bareng buat VLESS, VMess, Trojan, sama Shadowsocks legacy. Bikin sendiri di [uuidgenerator.net](https://www.uuidgenerator.net/).
-- **`UDP_RELAY_HOST`** — isi dengan IP atau hostname VPS kamu.
-- **`UDP_RELAY_PORT`** — pastikan nilainya sama persis dengan `LISTEN_PORT` di `udprelay.js`.
+- **`UDP_RELAY.host` + `UDP_RELAY.port`** — memakai relay TCP biasa. Keduanya harus valid; jika keduanya diisi, `websocket` tidak digunakan.
+- **`UDP_RELAY.websocket`** — memakai relay WebSocket dengan URL `ws://` atau `wss://`.
 - **`SS_METHOD`** — samain juga sama method yang dipakai di client Shadowsocks kamu.
+
+## Setup `wsudprelay.js`
+
+`wsudprelay.js` adalah UDP relay melalui WebSocket dan tidak membutuhkan package npm. Jalankan di VPS dengan Node.js versi 18 ke atas:
+
+```bash
+node wsudprelay.js
+```
+
+Konfigurasi default-nya:
+
+```js
+const CONFIG = Object.freeze({
+    LISTEN_HOST: '0.0.0.0',
+    LISTEN_PORT: 8080,
+    WS_PATH: '/',
+    MAX_WS_MESSAGE_BYTES: 4 * 1024 * 1024,
+    HANDSHAKE_TIMEOUT_MS: 10000,
+    IDLE_TIMEOUT_MS: 300000,
+    XUDP_GRACE_MS: 60000,
+    MAX_CONNECTIONS: 4096,
+    REJECT_UDP_443: true,
+});
+```
+
+Untuk koneksi tanpa TLS, gunakan:
+
+```js
+UDP_RELAY: {
+    websocket: 'ws://IP-VPS-ANDA.sslip.io:8080/',
+},
+```
+
+Untuk `wss://`, terminasi TLS di reverse proxy seperti Nginx, Caddy, atau Cloudflare Tunnel, lalu teruskan WebSocket ke `wsudprelay.js`. Contoh URL Worker:
+
+```js
+UDP_RELAY: {
+    websocket: 'wss://relay.example.com/',
+},
+```
+
+Nilai path pada URL harus sama dengan `WS_PATH`. Jika `WS_PATH` diubah menjadi `/udprelay`, gunakan `wss://relay.example.com/udprelay`.
 
 ## Setup `udprelay.js`
 
@@ -59,17 +110,17 @@ const CONFIG = Object.freeze({
 });
 ```
 
-Yang penting, `LISTEN_PORT` di sini harus sama dengan `UDP_RELAY_PORT` yang tadi diisi di Worker.
+Untuk relay TCP, `LISTEN_PORT` di `udprelay.js` harus sama dengan `UDP_RELAY.port` di Worker.
 
-## Jalanin relay-nya
+## Jalanin relay TCP
 
-`udprelay.js` perlu jalan di server (VPS) dengan Node.js versi 18 ke atas. Tinggal jalankan biasa:
+`udprelay.js` perlu jalan di VPS dengan Node.js versi 18 ke atas:
 
 ```bash
 node udprelay.js
 ```
 
-VPS-nya cukup buka akses TCP masuk di port `LISTEN_PORT`
+VPS-nya cukup buka akses TCP masuk di port `LISTEN_PORT`.
 
 ## Deploy Worker-nya
 
@@ -116,5 +167,6 @@ Misalnya:
 ## Yang perlu diketahui
 
 - Query DNS di UDP port 53 otomatis dialihkan lewat DNS-over-HTTPS, jadi nggak lewat relay VPS.
+- Relay WebSocket memakai path yang diatur oleh `WS_PATH`; default-nya `/`.
 - Trafik UDP selain port 53 diteruskan ke VPS relay.
 - UDP di port 443 bakal ditolak kalau `REJECT_UDP_443` diaktifkan.

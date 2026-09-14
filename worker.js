@@ -12,8 +12,14 @@ const CONFIG = Object.freeze({
     // aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305, xchacha20-ietf-poly1305,
     // 2022-blake3-aes-128-gcm, 2022-blake3-aes-256-gcm, 2022-blake3-chacha20-poly1305.
     SS_METHOD: 'aes-128-gcm',
-    UDP_RELAY_HOST: 'CHANGE_ME_TO_VPS_IP',
-    UDP_RELAY_PORT: 8443,
+    // UDP relay transport. TCP host+port takes priority when both forms are set.
+    // Examples:
+    // UDP_RELAY: { host: '203.0.113.10', port: 8443 },
+    // UDP_RELAY: { websocket: 'wss://relay.example.com/' },
+    // UDP_RELAY: { websocket: 'ws://127.0.0.1:8080/' },
+    UDP_RELAY: {
+       websocket: 'wss://relay.example.com/'
+    },
     MAX_PROTOCOL_HEADER: 4096,
     MAX_TCP_PROXY_REPLAY: 4 * 1024 * 1024,
     // Force HTTP/3 / QUIC (UDP/443) to fail so browsers fall back to TCP/443.
@@ -3363,6 +3369,119 @@ class TcpBridge {
     }
 }
 
+
+function normalizeUdpRelayConfig(value) {
+    const cfg = value && typeof value === 'object' ? value : {};
+    const host = String(cfg.host || '').trim();
+    const port = Number(cfg.port);
+    const hostConfigured = Boolean(host && host !== 'CHANGE_ME_TO_VPS_IP');
+    const portConfigured = Number.isInteger(port) && port >= 1 && port <= 65535;
+    if (hostConfigured && portConfigured) {
+        return { transport: 'tcp', host, port };
+    }
+    const websocket = String(cfg.websocket || '').trim();
+    if (websocket) {
+        let url;
+        try {
+            url = new URL(websocket);
+        }
+        catch {
+            throw new Error('CONFIG.UDP_RELAY.websocket must be a valid ws:// or wss:// URL');
+        }
+        if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+            throw new Error('CONFIG.UDP_RELAY.websocket must use ws:// or wss://');
+        }
+        return { transport: 'websocket', websocket: url.toString() };
+    }
+    if (hostConfigured || portConfigured) {
+        throw new Error('CONFIG.UDP_RELAY host and port must both be valid');
+    }
+    throw new Error('set CONFIG.UDP_RELAY to { host, port } or { websocket: "wss://..." } before using UDP/XUDP');
+}
+
+async function openWebSocketRelay(url) {
+    const ws = new WebSocket(url);
+    try {
+        ws.binaryType = 'arraybuffer';
+    }
+    catch { }
+    await new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+            ws.removeEventListener('open', onOpen);
+            ws.removeEventListener('error', onError);
+            ws.removeEventListener('close', onClose);
+        };
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            fn(value);
+        };
+        const onOpen = () => finish(resolve);
+        const onError = (event) => finish(reject, new Error(`UDP relay WebSocket connection failed${event?.message ? `: ${event.message}` : ''}`));
+        const onClose = (event) => finish(reject, new Error(`UDP relay WebSocket closed during connect (${event?.code || 1006})`));
+        ws.addEventListener('open', onOpen);
+        ws.addEventListener('error', onError);
+        ws.addEventListener('close', onClose);
+    });
+    let ended = false;
+    let messageChain = Promise.resolve();
+    const readable = new ReadableStream({
+        start(c) {
+            ws.addEventListener('message', (event) => {
+                messageChain = messageChain.then(async () => {
+                    if (ended) return;
+                    const bytes = await toUint8Array(event.data);
+                    if (bytes.byteLength) c.enqueue(bytes);
+                }).catch((error) => {
+                    if (ended) return;
+                    ended = true;
+                    try { c.error(error); } catch { }
+                    safeCloseWebSocket(ws);
+                });
+            });
+            ws.addEventListener('close', () => {
+                messageChain.finally(() => {
+                    if (ended) return;
+                    ended = true;
+                    try { c.close(); } catch { }
+                });
+            });
+            ws.addEventListener('error', (event) => {
+                messageChain.finally(() => {
+                    if (ended) return;
+                    ended = true;
+                    try { c.error(new Error(`UDP relay WebSocket error${event?.message ? `: ${event.message}` : ''}`)); } catch { }
+                });
+            });
+        },
+        cancel() {
+            ended = true;
+            safeCloseWebSocket(ws);
+        },
+    });
+    const writable = new WritableStream({
+        write(chunk) {
+            if (ws.readyState !== WS_OPEN) {
+                throw new Error('UDP relay WebSocket is not open');
+            }
+            ws.send(toU8Sync(chunk));
+        },
+        close() {
+            safeCloseWebSocket(ws);
+        },
+        abort() {
+            safeCloseWebSocket(ws);
+        },
+    });
+    return {
+        socket: ws,
+        writer: writable.getWriter(),
+        reader: new BufferedStreamReader(readable.getReader()),
+    };
+}
+
 class RelayConnection {
     constructor(socket, writer, reader, mode) {
         this.socket = socket;
@@ -3373,15 +3492,19 @@ class RelayConnection {
         this.writeChain = Promise.resolve();
     }
     static async open(mode, endpoint = null) {
-        const host = String(CONFIG.UDP_RELAY_HOST || '').trim();
-        const port = Number(CONFIG.UDP_RELAY_PORT);
-        if (!host || host === 'CHANGE_ME_TO_VPS_IP' || !Number.isInteger(port) || port < 1 || port > 65535) {
-            throw new Error('set CONFIG.UDP_RELAY_HOST and UDP_RELAY_PORT before using UDP/XUDP');
+        const relay = normalizeUdpRelayConfig(CONFIG.UDP_RELAY);
+        let socket;
+        let writer;
+        let reader;
+        if (relay.transport === 'tcp') {
+            socket = connect({ hostname: relay.host, port: relay.port }, { allowHalfOpen: true, secureTransport: 'off' });
+            await socket.opened;
+            writer = socket.writable.getWriter();
+            reader = new BufferedStreamReader(socket.readable.getReader());
         }
-        const socket = connect({ hostname: host, port }, { allowHalfOpen: true, secureTransport: 'off' });
-        await socket.opened;
-        const writer = socket.writable.getWriter();
-        const reader = new BufferedStreamReader(socket.readable.getReader());
+        else {
+            ({ socket, writer, reader } = await openWebSocketRelay(relay.websocket));
+        }
         const parts = [RELAY_MAGIC, new Uint8Array([mode])];
         if (mode === RELAY_MODE_FIXED_UDP) {
             parts.push(encodeRelayEndpoint(endpoint));
